@@ -1,0 +1,37 @@
+name: Offline tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  offline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      MPLBACKEND: Agg
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m ruff check .
+      - run: python -m unittest discover -s tests -t . -v
+      - run: python -m build
+      - run: python -m pip install --force-reinstall --no-deps --no-index --find-links dist ultrasonic-film-measurement==0.1.0
+      - name: Installed entry points
+        working-directory: ${{ runner.temp }}
+        run: |
+          film-live --help
+          film-diagnostics --help
+          film-scope --help
+          film-benchmark --help
+          film-replay-plot --help
+          film-native-client --help
+          python -c "from importlib.resources import files; assert files('ultrasonic_film').joinpath('native/rp_acquisition.cpp').is_file()"
