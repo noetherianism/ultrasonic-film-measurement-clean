@@ -1,45 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Program Mass Flow Ultrasonik - TURBO REAL-TIME 300 FPS & SHALLOW WATER TRACKING
-
-Algoritma deteksi: bandpass 3-4,8 MHz -> Hilbert -> moving average -> threshold ->
-blanking -> puncak akrilik -> puncak permukaan air -> hapus pantulan ganda (tampilan).
-
-Default (sejak 2026-10-17, dari rekaman akrilik 5 mm + air ~20/40 mm):
-  * MA 32 sampel (0,5 µs) dan threshold OTOMATIS = 1,2 x p99,9 puncak noise di 90-125 µs
-    (600 frame terakhir). Bolak-balik ke-2 dan ke-3 echo air terakhir (-2..+9,5 µs, termasuk
-    pantulan platnya) dikecualikan dari jendela noise agar threshold tidak naik di air dalam.
-    Jendela bisa diganti: --noise-us 60 85
-  * Akrilik: threshold 0,8 x threshold otomatis, setelah ekor ringing TX yang meluruh dari
-    tepi blanking dibuang (tanpa akrilik puncak selalu di tepi blanking 2,51 µs).
-  * Mode manual = algoritma SCPI lama persis:  --ma 128 --threshold 0.15
-  * --preset akrilik5mm menambah penolakan pantulan ulang plat (--pantulan-us 3.744).
-  * Lapisan air tipis (~0,25-2 mm, echo air bertumpuk dengan echo akrilik): --baseline FOLDER
-    (rekaman air tebal >= 10 mm, transduser tidak digeser) -> baseline removal (thin_layer.py,
-    Al-Aufi dkk. 2019). Status AIR_TIPIS_TIDAK_TERDETEKSI bila sisa < threshold.
-  * Tinggi air h = c*ToF/2 (mm) tampil di grafik dan tersimpan di kolom h_mm tof.csv;
-    c default 1466 m/s (terukur osiloskop), --c-air C, atau --suhu-air T (rumus Marczak).
-
-Yang berubah dari versi SCPI adalah jalur datanya:
-
-  * Akuisisi lewat server native DMA (sama seperti ultrasonic_film.live),
-    target 300 frame/detik, bukan SCPI ASCII.
-  * Thread penerima membaca SEMUA frame; thread DSP menghitung ToF untuk
-    SETIAP frame (dibatch agar cepat); grafik hanya menampilkan frame terbaru.
-  * Tombol "Mulai Rekam" (atau --rekam) menyimpan setiap frame mentah tanpa
-    kehilangan data (frames.bin, format sama dengan run_rp_benchmark --save-all)
-    plus hasil ToF per frame (tof.csv) di folder rekaman baru.
-
-Menjalankan (dari root repositori, PowerShell):
-    python -m ultrasonic_film                       # host default di bawah
-    python -m ultrasonic_film redpitaya.local --rekam --rekam-detik 10
-    python -m ultrasonic_film --scope siglent.local # + panel waveform Siglent
-    python -m ultrasonic_film --proses-ulang recordings/NAMA_FOLDER
-    python -m ultrasonic_film --preset akrilik5mm --rekam   # MA 32 + threshold noise + tolak pantulan plat
-
-Tutup jendela grafik (atau Ctrl+C) untuk berhenti. OUT1 dimatikan oleh server.
-"""
-
 import argparse
 from collections import deque
 from datetime import datetime
@@ -58,45 +16,40 @@ import time
 
 import numpy as np
 
-from . import live  # build + jalankan server native DMA via SSH (plink)
+from . import live
 from . import thin_layer as lapisan_tipis
 from .recording import FrameRecorder, SAMPLES_PER_FRAME, load_recording
 from .processing import Echo, EchoConfig, EchoDSP as _EchoDSP
 from .flow import FlowFeatures, FlowRegimeClassifier
 
-# ==========================================
-# 1. KONFIGURASI
-# ==========================================
 IP_ADDRESS   = os.environ.get('RP_HOST', 'redpitaya.local')
 SCOPE_IP     = os.environ.get('SIGLENT_HOST', 'siglent.local')
 FREQ_HZ      = 5_000_000
 N_CYCLES     = 1
-AWG_VOLT     = 1.0          # parameter amplitudo generator (V), bukan Vpp
-ACQ_DEC      = 2            # 125 MHz / 2 = 62,5 MHz
-TARGET_FPS   = 300          # laju akuisisi (tembakan) per detik
-DSP_BACKLOG_WARN = 150      # frame di antrean DSP (~0,5 s): peringatan, perekaman frames.bin tidak terganggu
-DISPLAY_FPS  = 15           # laju refresh grafik; terpisah dari akuisisi
-MUX_PROFILE  = 'single-ch1' # DIO0_P..DIO4_P = 0,0,0,0,1 (sama seperti versi SCPI)
+AWG_VOLT     = 1.0
+ACQ_DEC      = 2
+TARGET_FPS   = 300
+DSP_BACKLOG_WARN = 150
+DISPLAY_FPS  = 15
+MUX_PROFILE  = 'single-ch1'
 
 FILTER_LOW      = 3_000_000
 FILTER_HIGH     = 4_800_000
 DIGITAL_GAIN    = 12.0
-MA_WINDOW       = 32            # 0,5 µs (algoritma SCPI lama: 128)
-NOISE_THRESHOLD = 0.15          # threshold tetap, hanya dipakai pada mode manual (--threshold)
+MA_WINDOW       = 32
+NOISE_THRESHOLD = 0.15
 BLANK_US        = 2.5
 
-AKRILIK_US        = (2.5, 6.0)  # jendela cari puncak akrilik (µs dari trigger)
-AIR_MULAI_US      = 1.5         # mulai cari air sekian µs setelah akrilik
-AIR_SELESAI_US    = 120.0       # batas akhir cari air (relatif akrilik)
-PANTULAN_GANDA_US = 2.5         # tampilan: hapus envelope > (ToF air + ini)
+AKRILIK_US        = (2.5, 6.0)
+AIR_MULAI_US      = 1.5
+AIR_SELESAI_US    = 120.0
+PANTULAN_GANDA_US = 2.5
 
-# Tinggi air h = C_AIR * ToF / 2 (ToF relatif echo akrilik = bolak-balik di air saja).
-C_AIR    = 1466.0               # m/s, terukur dengan osiloskop 2026-10-17 (air ~15 °C)
-SUHU_AIR = None                 # °C; bila diisi (--suhu-air), C_AIR dihitung dengan rumus Marczak
+C_AIR    = 1466.0
+SUHU_AIR = None
 
 
 def c_air_marczak(suhu_c):
-    """Kecepatan suara air murni (m/s), Marczak (1997), berlaku 0-95 °C. 15 °C -> 1465,96 m/s."""
     if not 0 <= suhu_c <= 95:
         raise ValueError('Rumus Marczak berlaku 0-95 °C')
     t = suhu_c
@@ -105,50 +58,35 @@ def c_air_marczak(suhu_c):
 
 
 def tinggi_air_mm(tof_us):
-    """ToF air (µs, bolak-balik) -> tinggi air (mm) dengan C_AIR."""
     return C_AIR * tof_us / 2000.0
 
 
-# Lapisan air tipis (--baseline FOLDER): baseline removal, lihat thin_layer.py.
-BASELINE = None                 # lapisan_tipis.BaselineTipis atau None (mode ToF biasa)
+BASELINE = None
 
-# Threshold otomatis (default). --threshold X = mode manual = algoritma SCPI lama persis
-# (tanpa faktor akrilik, tanpa pembuangan ekor ringing, tanpa jendela noise).
-THRESHOLD_NOISE   = 1.2           # faktor x p99,9 puncak noise di NOISE_REF_US; None = NOISE_THRESHOLD tetap
-THRESHOLD_AKRILIK = 0.8           # threshold akrilik = faktor ini x threshold otomatis (aman 0,8-0,9: 0,7 -> 0,1% palsu, 1,0 -> frame lemah hilang)
-AKRILIK_NAIK      = 1.5           # puncak akrilik harus naik > ini x lembah setelah ekor ringing TX
-NOISE_REF_US      = (90.0, 125.0) # jendela noise (sebelum IDX_MAX = 128 µs)
-NOISE_HISTORY     = 600           # jumlah frame riwayat puncak noise (~2 s pada 300 FPS)
-NOISE_KECUALI_US  = (-2.0, 9.5)   # dikecualikan dari jendela noise: m*ToF air terakhir + rentang ini
-                                  # (+9,5 µs mencakup 2 pantulan plat 3,7 µs; terukur pada air ~40 mm)
-NOISE_KECUALI_M   = (2, 3)        # m = bolak-balik ke-2 dan ke-3
-PANTULAN_US       = None          # periode pantulan ulang plat (µs); None = tanpa penolakan
-PANTULAN_R        = 0.15          # rasio amplitudo per pantulan (terukur 0,15 dengan air, 0,39 tanpa air)
-PANTULAN_LEBAR_US = 0.8           # setengah lebar jendela di sekitar akrilik + k*PANTULAN_US
-PANTULAN_MARGIN   = 2.0           # puncak di jendela itu diterima hanya bila > margin x prediksi pantulan
-# Terukur 2026-10-17 pada akrilik 5 mm (echo 4,53 µs, pantulan 3,744 µs), air ~20 dan ~40 mm:
-# MA 32 + threshold noise memberi ToF air 99,9-100% benar, std 23-28 ns
-# (MA 128 + threshold 0,15: 61-90% benar, std 307-333 ns, salah pilih side-lobe +2 µs).
+THRESHOLD_NOISE   = 1.2
+THRESHOLD_AKRILIK = 0.8
+AKRILIK_NAIK      = 1.5
+NOISE_REF_US      = (90.0, 125.0)
+NOISE_HISTORY     = 600
+NOISE_KECUALI_US  = (-2.0, 9.5)
+NOISE_KECUALI_M   = (2, 3)
+PANTULAN_US       = None
+PANTULAN_R        = 0.15
+PANTULAN_LEBAR_US = 0.8
+PANTULAN_MARGIN   = 2.0
 PRESETS = {'akrilik5mm': dict(ma=32, threshold_noise=1.2, pantulan_us=3.744)}
 
-IDX_MAX = 8000                  # hanya 8000 sampel pertama (~128 µs) yang diproses
-# DMA mengirim raw ADC count (14-bit, gain LV ±1 V). Konversi ke volt belum
-# dikalibrasi; versi SCPI memakai volt terkalibrasi, jadi NOISE_THRESHOLD
-# mungkin perlu sedikit disetel ulang.
+IDX_MAX = 8000
 VOLT_PER_COUNT = 1.0 / 8192
 
-FOLDER_REKAMAN = Path('recordings')  # relative to the working directory, never the installed package
-TREND_DETIK    = 10             # panjang grafik tren ToF (detik)
+FOLDER_REKAMAN = Path('recordings')
+TREND_DETIK    = 10
 
 MAGIC_TX_ON, MAGIC_TX_OFF, MAGIC_END = 0x52554C31, 0x52554C30, 0x52504531
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2
 
 
-# ==========================================
-# 2. DSP (algoritma asli, versi batch)
-# ==========================================
 def dsp_config():
-    """Snapshot CLI settings for one processor; existing processors remain stable."""
     return EchoConfig(
         filter_low_hz=FILTER_LOW,
         filter_high_hz=FILTER_HIGH,
@@ -177,7 +115,6 @@ def dsp_config():
 
 
 class EchoDSP(_EchoDSP):
-    """CLI adapter retaining the legacy constructor and default settings."""
 
     def __init__(self, sample_rate, config=None, secondary_peaks=False):
         selected = config if config is not None else dsp_config()
@@ -187,7 +124,6 @@ class EchoDSP(_EchoDSP):
 
 
 class TofWriter:
-    """tof.csv: satu baris per frame tersimpan; ditulis oleh thread DSP."""
     HEADER = 'frame_index,stream_sequence,receive_elapsed_seconds,status,waktu_akrilik_us,tof_air_us,amp_air,h_mm\n'
     FLOW_HEADER = ('tof_internal_us,n_peaks,flow_pattern,flow_age_s,mean_h_mm,sigma_h_mm,'
                    'amplitude_cv,f_wave_hz,wave_h_pp_mm,internal_fraction,valid_fraction')
@@ -217,7 +153,6 @@ class TofWriter:
 
 
 def deteksi_batch(dsp, volts):
-    """volts (batch, IDX_MAX) -> (envelope, list Echo). Dengan BASELINE: ToF dari baseline removal."""
     env = dsp.envelope(volts)
     echoes = [dsp.detect(row) for row in env]
     if BASELINE is not None:
@@ -226,7 +161,6 @@ def deteksi_batch(dsp, volts):
 
 
 def muat_baseline(folder, rata=1, faktor=None, cocok=None):
-    """Baseline lapisan tipis dari rekaman air tebal: akrilik & ToF air dideteksi dengan DSP biasa."""
     folder = Path(folder)
     waveforms, metadata = load_recording(folder)
     fs = metadata['sample_rate_hz']
@@ -251,18 +185,14 @@ def muat_baseline(folder, rata=1, faktor=None, cocok=None):
 
 
 class EchoProcessor(threading.Thread):
-    """Hitung ToF untuk setiap frame yang diterima, dalam batch, di luar thread GUI."""
     MAX_BATCH = 64
 
     def __init__(self, trend_seconds=TREND_DETIK, averages=1, median_n=1, flow_features=False, flow_window=2.0,
                  flow_nominal_fps=None):
         super().__init__(daemon=True)
-        # averages > 1: rata-rata N waveform terakhir (sejajar trigger) SEBELUM filter.
-        # Noise acak turun ~sqrt(N); echo yang stabil tetap. Respons waktu ~N/300 detik.
         self.averages = max(1, int(averages))
         self._ring = deque()
         self._sum = None
-        # median_n > 1: angka ToF yang ditampilkan = median N deteksi valid terakhir.
         self.median_n = max(1, int(median_n))
         self._recent_tof = deque(maxlen=self.median_n)
         self.inbox = queue.SimpleQueue()
@@ -270,13 +200,12 @@ class EchoProcessor(threading.Thread):
         self.trend_seconds = trend_seconds
         self.dsp = None
         self.latest = None
-        self.history = deque()     # (waktu_terima, tof_air_us) yang valid
+        self.history = deque()
         self.processed = 0
         self.detected = 0
         self.dsp_fps = 0.0
         self._times = deque()
         self.error = None
-        # flow_nominal_fps: sequence time base (default CLI); None: PC receive time base
         self.flow = FlowRegimeClassifier(flow_window, nominal_fps=flow_nominal_fps) if flow_features else None
 
     def snapshot(self):
@@ -322,7 +251,6 @@ class EchoProcessor(threading.Thread):
             print(self.error, flush=True)
 
     def _process(self, batch):
-        # item: ('frame', sequence, waktu_terima, counts, writer, index_rekam, elapsed_rekam)
         volts = self.dsp.to_volts(np.stack([item[3] for item in batch]))
         if self.averages > 1:
             volts = self._running_average(volts)
@@ -372,11 +300,7 @@ class EchoProcessor(threading.Thread):
         return out
 
 
-# ==========================================
-# 3. PENERIMA 300 FPS + PEREKAM
-# ==========================================
 class MassFlowAcquisition(live.LiveAcquisition):
-    """SSH build/launch dari ultrasonic_film.live; receive() diganti: semua frame -> rekam + DSP."""
 
     def __init__(self, args, password, plink, processor):
         super().__init__(args, password, plink)
@@ -385,9 +309,9 @@ class MassFlowAcquisition(live.LiveAcquisition):
         self.record_dir = None
         self.record_frames = 0
         self.record_message = ''
-        self.backlog = 0            # ukuran antrean DSP terakhir (frame)
+        self.backlog = 0
         self.backlog_max = 0
-        self.backlog_events = 0     # berapa kali antrean melewati DSP_BACKLOG_WARN
+        self.backlog_events = 0
 
     def set_recording(self, enabled):
         with self.lock:
@@ -458,7 +382,6 @@ class MassFlowAcquisition(live.LiveAcquisition):
         except Exception as error:
             message = f'Rekaman bermasalah ({type(error).__name__}: {error}) -> {rec["dir"]}'
         finally:
-            # Ditutup oleh thread DSP setelah semua frame rekaman ini diproses.
             self.processor.inbox.put(('close', rec['writer']))
         if exc is not None:
             message = f'Rekaman terhenti karena error ({recorder.frames} frame) -> {rec["dir"]}'
@@ -473,7 +396,7 @@ class MassFlowAcquisition(live.LiveAcquisition):
         self.sample_rate = sample_rate
         self.processor.inbox.put(('config', sample_rate))
         self.started = time.perf_counter()
-        rp._socket.sendall(b'1')  # TX selalu ON: burst OUT1 + trigger ADC AWG_PE
+        rp._socket.sendall(b'1')
         times, quitting, rec = deque(), False, None
         try:
             while True:
@@ -514,13 +437,12 @@ class MassFlowAcquisition(live.LiveAcquisition):
                 writer = index = elapsed = None
                 if rec is not None:
                     index, elapsed, writer = rec['recorder'].frames, now - rec['start'], rec['writer']
-                    rec['recorder'].append(index, payload, elapsed)  # lossless, sebelum DSP
+                    rec['recorder'].append(index, payload, elapsed)
                     with self.lock:
                         self.record_frames = index + 1
                 if self.processor.error is None:
                     counts = np.frombuffer(payload, dtype='<i2', count=IDX_MAX).copy()
                     self.processor.inbox.put(('frame', sequence, now, counts, writer, index, elapsed))
-                    # Antrean tak terbatas: hanya diukur dan diperingatkan; frames.bin sudah ditulis di atas.
                     backlog = self.processor.inbox.qsize()
                     if backlog > DSP_BACKLOG_WARN >= self.backlog:
                         self.backlog_events += 1
@@ -540,9 +462,6 @@ class MassFlowAcquisition(live.LiveAcquisition):
                 self._close_recording(rec)
 
 
-# ==========================================
-# 4. PROSES ULANG REKAMAN (tanpa perangkat)
-# ==========================================
 def reprocess(folder, show_plot=True, averages=1, flow_features=False, flow_window=2.0, flow_timebase='sequence'):
     folder = Path(folder)
     averager = EchoProcessor(averages=averages) if averages > 1 else None
@@ -560,9 +479,6 @@ def reprocess(folder, show_plot=True, averages=1, flow_features=False, flow_wind
     timing = np.loadtxt(folder / 'frame_times.csv', delimiter=',', skiprows=1, ndmin=2)
     timing_valid = len(timing) == len(waveforms)
     elapsed = timing[:, 1] if timing_valid else np.arange(len(waveforms)) / nominal_fps
-    # Rekaman lama: frame_times.csv dari time.monotonic() Windows (15,625 ms, banyak dt = 0); basis waktu
-    # sequence hanya memakainya untuk memvalidasi laju. Tanpa timing yang cocok tidak ada bukti laju:
-    # indeks/nominal tidak boleh dipakai sebagai pengganti (akan selalu "lulus"), jadi TIMING_UNCERTAIN.
     flow_times = elapsed if timing_valid else np.full(len(waveforms), np.nan)
     writer = TofWriter(folder / 'tof_offline.csv', mode='w', flow_features=flow_features)
     (folder / 'analysis_offline.json').write_text(json.dumps(dict(
@@ -633,9 +549,6 @@ def reprocess(folder, show_plot=True, averages=1, flow_features=False, flow_wind
     return tof
 
 
-# ==========================================
-# 5. ARGUMEN & GRAFIK REAL-TIME
-# ==========================================
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description='Mass flow ultrasonik real-time 300 FPS + rekam')
     p.add_argument('host', nargs='?', default=IP_ADDRESS)
@@ -761,19 +674,17 @@ def parse_args(argv=None):
         p.error('--scope-ch hanya C1..C4')
     if args.scope_setup and not args.scope:
         args.scope = SCOPE_IP
-    # Parameter yang dibutuhkan LiveAcquisition.run() untuk menjalankan server.
     args.frequency, args.cycles, args.amplitude, args.decimation, args.tx = FREQ_HZ, N_CYCLES, AWG_VOLT, ACQ_DEC, 'on'
     return args
 
 
 def apply_dsp_options(args):
-    """Opsi CLI -> konstanta DSP modul (disalin EchoDSP saat dibuat)."""
     global FILTER_LOW, FILTER_HIGH, BLANK_US, AKRILIK_US, AIR_MULAI_US, AIR_SELESAI_US, NOISE_THRESHOLD
     global MA_WINDOW, THRESHOLD_NOISE, THRESHOLD_AKRILIK, NOISE_REF_US, PANTULAN_US, PANTULAN_R
     global C_AIR, SUHU_AIR
     if args.c_air is not None:
         C_AIR = args.c_air
-    if args.suhu_air is not None:   # menimpa --c-air
+    if args.suhu_air is not None:
         SUHU_AIR = args.suhu_air
         C_AIR = c_air_marczak(args.suhu_air)
     if args.ma is not None:
@@ -796,13 +707,12 @@ def apply_dsp_options(args):
         AKRILIK_US = tuple(args.akrilik_us)
     if args.air_us:
         AIR_MULAI_US, AIR_SELESAI_US = args.air_us
-    if args.threshold is not None:   # mode manual: threshold tetap, algoritma lama
+    if args.threshold is not None:
         NOISE_THRESHOLD = args.threshold
         THRESHOLD_NOISE = None
 
 
 def flow_plate_warning(flow_features):
-    """--flow-features tanpa penolakan pantulan plat: puncak internal bisa palsu (review H1)."""
     if not flow_features or PANTULAN_US is not None or BASELINE is not None:
         return None
     return ('PERINGATAN: --flow-features tanpa --pantulan-us / --preset akrilik5mm. Pantulan ulang plat '
@@ -833,7 +743,6 @@ def main(argv=None):
     plink = shutil.which('plink') or r'C:\Program Files\PuTTY\plink.exe'
     if not Path(plink).is_file():
         raise SystemExit('PuTTY plink.exe diperlukan (sama seperti ultrasonic_film.live)')
-    # RP_PASSWORD (environment variable) agar bisa dijalankan non-interaktif; jangan simpan di repo.
     password = os.environ.get('RP_PASSWORD') or getpass.getpass(f'SSH password for {args.user}@{args.host}: ')
     processor = EchoProcessor(averages=args.rata, median_n=args.median,
                               flow_features=args.flow_features, flow_window=args.flow_window,
@@ -924,7 +833,6 @@ def main(argv=None):
                 state['start'] = time.perf_counter()
             dsp, echo = latest['dsp'], latest['echo']
             line_raw.set_data(dsp.waktu_us, latest['volts'])
-            # Skala Y otomatis: echo mV tidak tenggelam di sumbu ±1 V.
             vmax = float(np.max(np.abs(latest['volts'])))
             ax1.set_ylim(-max(vmax * 1.2, 0.005), max(vmax * 1.2, 0.005))
             vpp = float(np.ptp(latest['volts']))
@@ -939,7 +847,6 @@ def main(argv=None):
             if BASELINE is not None:
                 ax2.set_title(ax2.get_title() + f" [lapisan tipis, kecocokan baseline {BASELINE.cocok_rasio:.1f}x]")
             if echo.status == 'OK':
-                # mode baseline: amp_air = amplitudo sisa (satuan lain) -> penanda di kurva envelope
                 y_air = float(np.interp(echo.tof_air_us, relatif, env)) if BASELINE is not None else echo.amp_air
                 marker_air.set_offsets(np.c_[echo.tof_air_us, y_air])
                 teks = f"ToF Air: {echo.tof_air_us:.2f} µs  |  h = {tinggi_air_mm(echo.tof_air_us):.2f} mm"
